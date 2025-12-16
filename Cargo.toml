@@ -1,0 +1,8 @@
+[package]
+name = "dd-profiler-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+differential-dataflow = "0.18.0"
+timely = "0.25.1"
