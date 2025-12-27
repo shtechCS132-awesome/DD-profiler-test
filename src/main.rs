@@ -21,9 +21,25 @@ use timely::progress::reachability::logging::TrackerEventBuilder;
 use timely::dataflow::operators::core::*;
 use timely::dataflow::Scope;
 
+// NEW: minimal imports for aggregation
+use std::collections::HashMap;
+// NEW: fix move into closure
+use std::cell::RefCell;
+use std::rc::Rc;
+
 type Diff = differential_dataflow::difference::Present;
 type Iter = u16;
 const SEMIRING_ONE: Diff = differential_dataflow::difference::Present;
+
+// NEW: minimal stats struct
+#[derive(Clone, Debug, Default)]
+struct OpStats {
+    name: String,
+    addr: String,
+    total_active: Duration,
+    activations: u64,
+    current_start: Option<Duration>,
+}
 
 fn main() {
     timely::execute_from_args(std::env::args(), |worker| {
@@ -35,6 +51,10 @@ fn main() {
         // NEW BLOCK: register Timely logging on this worker,
         // writing each stream to its own file.
         // =========================================================
+
+        // NEW: per-worker aggregate map (minimal; shared with the closure)
+        let op_stats: Rc<RefCell<HashMap<usize, OpStats>>> = Rc::new(RefCell::new(HashMap::new()));
+        let op_stats_in_log = op_stats.clone();
 
         // 1) Core Timely events: operator creation, scheduling, channels, etc.
         // let timely_file = File::create(format!("timely_worker_{}.log", index))
@@ -77,15 +97,39 @@ fn main() {
                                     ts, op.id, op.addr, op.name
                                 )
                                 .expect("failed to write OPERATES log");
+
+                                // NEW: record metadata in hashmap
+                                let mut map = op_stats_in_log.borrow_mut();
+                                let entry = map.entry(op.id).or_default();
+                                entry.name = op.name.to_string();
+                                entry.addr = format!("{:?}", op.addr);
                             }
                             // Operator scheduled: start/stop with timestamp
                             TimelyEvent::Schedule(sched) => {
-                                let kind = match sched.start_stop {
-                                    StartStop::Start => "START",
-                                    StartStop::Stop => "STOP",
-                                };
-                                writeln!(op_writer, "[{:?}] SCHEDULE {} id={}", ts, kind, sched.id)
-                                    .expect("failed to write SCHEDULE log");
+                                // NEW: accumulate (Stop - Start) and activation count.
+                                let mut map = op_stats_in_log.borrow_mut();
+                                let entry = map.entry(sched.id).or_default();
+                                match sched.start_stop {
+                                    StartStop::Start => {
+                                        entry.current_start = Some(*ts);
+                                    }
+                                    StartStop::Stop => {
+                                        if let Some(st) = entry.current_start.take() {
+                                            let delta =
+                                                ts.checked_sub(st).unwrap_or(Duration::ZERO);
+                                            entry.total_active += delta;
+                                            entry.activations += 1;
+                                        }
+                                    }
+                                }
+
+                                // keep reference code in place; don't spam logs
+                                // let kind = match sched.start_stop {
+                                //     StartStop::Start => "START",
+                                //     StartStop::Stop => "STOP",
+                                // };
+                                // writeln!(op_writer, "[{:?}] SCHEDULE {} id={}", ts, kind, sched.id)
+                                //     .expect("failed to write SCHEDULE log");
                             }
                             // ignore everything else
                             _ => {}
@@ -150,31 +194,31 @@ fn main() {
         //     );
 
         // 4) Summary events: per-operator aggregated statistics.
-        let summary_file = File::create(format!("summary_worker_{}.log", index))
-            .expect("failed to create summary log file");
-        let mut summary_writer = BufWriter::new(summary_file);
+        // let summary_file = File::create(format!("summary_worker_{}.log", index))
+        //     .expect("failed to create summary log file");
+        // let mut summary_writer = BufWriter::new(summary_file);
 
-        worker
-            .log_register()
-            .unwrap()
-            // NOTE: use `()` here to match your dataflow timestamp type.
-            .insert::<TimelySummaryEventBuilder<usize>, _>(
-                "timely/summary/usize",
-                move |_time, data| {
-                    if let Some(data) = data {
-                        // `data` is a batch of (ts, summary_event) pairs
-                        for (_ts, summary) in data.iter() {
-                            // Start simple: just dump the Debug. You’ll see fields like
-                            // id, activations, total time, maybe histograms depending on timely version.
-                            writeln!(summary_writer, "{:?}", summary)
-                                .expect("failed to write summary log");
-                        }
-                    } else {
-                        // just flush, no extra "[flush ...]" spam
-                        summary_writer.flush().expect("failed to flush summary log");
-                    }
-                },
-            );
+        // worker
+        //     .log_register()
+        //     .unwrap()
+        //     // NOTE: use `()` here to match your dataflow timestamp type.
+        //     .insert::<TimelySummaryEventBuilder<usize>, _>(
+        //         "timely/summary/usize",
+        //         move |_time, data| {
+        //             if let Some(data) = data {
+        //                 // `data` is a batch of (ts, summary_event) pairs
+        //                 for (_ts, summary) in data.iter() {
+        //                     // Start simple: just dump the Debug. You’ll see fields like
+        //                     // id, activations, total time, maybe histograms depending on timely version.
+        //                     writeln!(summary_writer, "{:?}", summary)
+        //                         .expect("failed to write summary log");
+        //                 }
+        //             } else {
+        //                 // just flush, no extra "[flush ...]" spam
+        //                 summary_writer.flush().expect("failed to flush summary log");
+        //             }
+        //         },
+        //     );
 
         // 5) Example user-level log stream (optional).
         // type MyBuilder = CapacityContainerBuilder<Vec<(Duration, ())>>;
@@ -305,6 +349,39 @@ fn main() {
         }
 
         while worker.step() {}
+
+        // NEW: write final per-operator totals (minimal; separate file)
+        {
+            let map = op_stats.borrow();
+            let mut rows: Vec<(usize, OpStats)> =
+                map.iter().map(|(id, st)| (*id, st.clone())).collect();
+            rows.sort_by_key(|(id, _st)| *id);
+
+            let stats_file = File::create(format!("operator_stats_worker_{}.log", index))
+                .expect("failed to create operator stats log file");
+            let mut stats_writer = BufWriter::new(stats_file);
+
+            // header (left-aligned)
+            writeln!(
+                stats_writer,
+                "{:<20} {:<12} {:<16} {}",
+                "addr", "activations", "total_active_ms", "name"
+            )
+            .ok();
+
+            for (_id, st) in rows {
+                let total_ms = st.total_active.as_secs_f64() * 1000.0;
+
+                writeln!(
+                    stats_writer,
+                    "{:<20} {:<12} {:<16.3} {}",
+                    st.addr, st.activations, total_ms, st.name
+                )
+                .ok();
+            }
+
+            stats_writer.flush().ok();
+        }
 
         if index == 0 {
             println!("{:?}:\tDataflow executed", timer.elapsed());
